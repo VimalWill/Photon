@@ -3,7 +3,7 @@ os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.0;8.6;9.0")
 
 from setuptools import setup
 import torch.utils.cpp_extension as cpp_ext
-cpp_ext._check_cuda_version = lambda *_: None  # system CUDA 12.2 vs torch cu130
+cpp_ext._check_cuda_version = lambda *_: None  # bypass torch/system CUDA version mismatch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
