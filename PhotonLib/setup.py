@@ -1,5 +1,5 @@
 import os
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.0;8.6;8.7;9.0")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.0;8.6;9.0")
 
 from setuptools import setup
 import torch.utils.cpp_extension as cpp_ext
