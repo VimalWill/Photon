@@ -178,9 +178,20 @@ namespace Photon {
         if (d <= flashMaxD) {
             size_t smem = ((size_t)d * d + 3 * d) * sizeof(float);
             int threads = ((d + 31) / 32) * 32;
-            if (sm_major >= 9)
-                cudaFuncSetAttribute(flashLinearAttn,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, 228 * 1024);
+            if (smem > 49152) {
+                // Need to opt in to the device's extended shared memory limit.
+                // Query the actual maximum rather than hardcoding an arch constant.
+                int max_smem = 49152;
+                cudaDeviceGetAttribute(&max_smem,
+                    cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+                TORCH_CHECK((size_t)max_smem >= smem,
+                    "flash path needs ", smem, " B smem but device max is ", max_smem, " B");
+                TORCH_CHECK(
+                    cudaFuncSetAttribute(flashLinearAttn,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        max_smem) == cudaSuccess,
+                    "cudaFuncSetAttribute failed");
+            }
             flashLinearAttn<<<b, threads, smem, s_main>>>(Q, K, V, Out, n, d);
         } else {
             auto opts = torch::TensorOptions()
@@ -217,7 +228,8 @@ namespace Photon {
         }
 
         cudaDeviceSynchronize();
-        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel error in LinearAttn");
+        cudaError_t err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess, "CUDA kernel error in LinearAttn: ", cudaGetErrorString(err));
     }
 }
 
