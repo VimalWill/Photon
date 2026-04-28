@@ -8,48 +8,62 @@ namespace Photon {
         return 1.0f + x;
     }
 
-
-    __global__ void computeZ(
+    // Grid: (d_stripes, b*num_chunks, 1)  — each block owns one (stripe, chunk, batch).
+    __global__ void computeZChunked(
         const float* __restrict__ K,
         float*                    z,
-        int n, int d
+        int n, int d, int num_chunks
     ) {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        int b = blockIdx.y;
+        int i     = blockIdx.x * blockDim.x + threadIdx.x;
+        int chunk = blockIdx.y % num_chunks;
+        int b     = blockIdx.y / num_chunks;
         if (i >= d) return;
+
+        int chunk_size = (n + num_chunks - 1) / num_chunks;
+        int t_start    = chunk * chunk_size;
+        int t_end      = min(t_start + chunk_size, n);
 
         float acc = 0.f;
         const float* Kb = K + (ptrdiff_t)b * n * d;
-        for (int t = 0; t < n; t++)
+        for (int t = t_start; t < t_end; t++)
             acc += taylorD1Phi(Kb[(ptrdiff_t)t * d + i]);
-        z[(ptrdiff_t)b * d + i] = acc;
+        atomicAdd(&z[(ptrdiff_t)b * d + i], acc);
     }
 
+    // Grid: (d/T, d/T, b*num_chunks) — each block owns one (row-tile, col-tile, n-chunk, batch).
+    // Partial sums are atomically folded into S so no second reduction kernel is needed.
     template <int T>
-    __global__ void fusedRecurrentState(
+    __global__ void fusedRecurrentStateChunked(
         const float* __restrict__ K,
         const float* __restrict__ V,
         float*                    S,
-        int n, int d
+        int n, int d, int num_chunks
     ) {
-        int row = blockIdx.y * T + threadIdx.y;
-        int col = blockIdx.x * T + threadIdx.x;
-        int b   = blockIdx.z;
+        int chunk = blockIdx.z % num_chunks;
+        int b     = blockIdx.z / num_chunks;
+        int row   = blockIdx.y * T + threadIdx.y;
+        int col   = blockIdx.x * T + threadIdx.x;
         if (row >= d || col >= d) return;
+
+        int chunk_size = (n + num_chunks - 1) / num_chunks;
+        int t_start    = chunk * chunk_size;
+        int t_end      = min(t_start + chunk_size, n);
 
         ptrdiff_t kv_base = (ptrdiff_t)b * n * d;
         ptrdiff_t s_base  = (ptrdiff_t)b * d * d;
 
         __shared__ float Stile[T][T];
-        Stile[threadIdx.y][threadIdx.x] = S[s_base + row * d + col];
+        Stile[threadIdx.y][threadIdx.x] = 0.f;
 
-        for (int t = 0; t < n; t++) {
+        for (int t = t_start; t < t_end; t++) {
             float pk = taylorD1Phi(K[kv_base + t * d + row]);
             float vj = V[kv_base + t * d + col];
             Stile[threadIdx.y][threadIdx.x] += pk * vj;
         }
 
-        S[s_base + row * d + col] = Stile[threadIdx.y][threadIdx.x];
+        // Each (row,col) has a unique S slot, so different chunks race only on
+        // their own element — contention is bounded by num_chunks.
+        atomicAdd(&S[s_base + row * d + col], Stile[threadIdx.y][threadIdx.x]);
     }
 
     template <int T>
@@ -124,30 +138,44 @@ namespace Photon {
         cudaEvent_t ready;
         cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
 
-        computeZ<<<dim3((d + 255) / 256, b), 256, 0, s_side>>>(K, z, n, d);
+        // ~64 tokens per chunk exposes N-parallelism while keeping per-block work substantial.
+        int num_chunks = max(1, min((n + 63) / 64, 128));
 
-        // Tile size T chosen so (d/T)^2 * b blocks ≈ 64b, keeping the grid large
-        // enough to fill the SM array regardless of d.
+        computeZChunked<<<dim3((d + 255) / 256, b * num_chunks), 256, 0, s_side>>>(
+            K, z, n, d, num_chunks);
+
         if (d <= 64) {
-            fusedRecurrentState<8><<<dim3((d+7)/8,(d+7)/8,b), dim3(8,8), 0, s_main>>>(K, V, S, n, d);
+            constexpr int T = 8;
+            fusedRecurrentStateChunked<T><<<dim3((d+T-1)/T,(d+T-1)/T, b*num_chunks), dim3(T,T), 0, s_main>>>(
+                K, V, S, n, d, num_chunks);
             cudaEventRecord(ready, s_side);
             cudaStreamWaitEvent(s_main, ready);
-            normalize<8><<<dim3((d+7)/8,(n+7)/8,b), dim3(8,8), 0, s_main>>>(Q, S, z, Out, n, d);
+            normalize<T><<<dim3((d+T-1)/T,(n+T-1)/T,b), dim3(T,T), 0, s_main>>>(
+                Q, S, z, Out, n, d);
         } else if (d <= 128) {
-            fusedRecurrentState<16><<<dim3((d+15)/16,(d+15)/16,b), dim3(16,16), 0, s_main>>>(K, V, S, n, d);
+            constexpr int T = 16;
+            fusedRecurrentStateChunked<T><<<dim3((d+T-1)/T,(d+T-1)/T, b*num_chunks), dim3(T,T), 0, s_main>>>(
+                K, V, S, n, d, num_chunks);
             cudaEventRecord(ready, s_side);
             cudaStreamWaitEvent(s_main, ready);
-            normalize<16><<<dim3((d+15)/16,(n+15)/16,b), dim3(16,16), 0, s_main>>>(Q, S, z, Out, n, d);
+            normalize<T><<<dim3((d+T-1)/T,(n+T-1)/T,b), dim3(T,T), 0, s_main>>>(
+                Q, S, z, Out, n, d);
         } else if (sm_major >= 9) {
-            fusedRecurrentState<32><<<dim3((d+31)/32,(d+31)/32,b), dim3(32,32), 0, s_main>>>(K, V, S, n, d);
+            constexpr int T = 32;
+            fusedRecurrentStateChunked<T><<<dim3((d+T-1)/T,(d+T-1)/T, b*num_chunks), dim3(T,T), 0, s_main>>>(
+                K, V, S, n, d, num_chunks);
             cudaEventRecord(ready, s_side);
             cudaStreamWaitEvent(s_main, ready);
-            normalize<32><<<dim3((d+31)/32,(n+31)/32,b), dim3(32,32), 0, s_main>>>(Q, S, z, Out, n, d);
+            normalize<T><<<dim3((d+T-1)/T,(n+T-1)/T,b), dim3(T,T), 0, s_main>>>(
+                Q, S, z, Out, n, d);
         } else {
-            fusedRecurrentState<16><<<dim3((d+15)/16,(d+15)/16,b), dim3(16,16), 0, s_main>>>(K, V, S, n, d);
+            constexpr int T = 16;
+            fusedRecurrentStateChunked<T><<<dim3((d+T-1)/T,(d+T-1)/T, b*num_chunks), dim3(T,T), 0, s_main>>>(
+                K, V, S, n, d, num_chunks);
             cudaEventRecord(ready, s_side);
             cudaStreamWaitEvent(s_main, ready);
-            normalize<16><<<dim3((d+15)/16,(n+15)/16,b), dim3(16,16), 0, s_main>>>(Q, S, z, Out, n, d);
+            normalize<T><<<dim3((d+T-1)/T,(n+T-1)/T,b), dim3(T,T), 0, s_main>>>(
+                Q, S, z, Out, n, d);
         }
 
         cudaEventDestroy(ready);
