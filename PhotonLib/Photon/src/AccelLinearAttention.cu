@@ -139,7 +139,7 @@ namespace Photon {
         cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
 
         // ~64 tokens per chunk exposes N-parallelism while keeping per-block work substantial.
-        int num_chunks = max(1, min((n + 63) / 64, 128));
+        int num_chunks = max(1, min((n + 31) / 32, 128));
 
         computeZChunked<<<dim3((d + 255) / 256, b * num_chunks), 256, 0, s_side>>>(
             K, z, n, d, num_chunks);
