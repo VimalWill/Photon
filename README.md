@@ -122,6 +122,78 @@ Flash path covers d <= 128 (sm80)
 
 ---
 
+## HPC / SLURM deployment
+
+### Interactive session (2 GPUs)
+
+```bash
+salloc --account=<--> --partition=gpu_standard \
+       --nodes=1 --ntasks=2 --time=2:00:00 \
+       --job-name=multi-gpu --gres=gpu:2
+```
+
+Once the shell is granted, load the required modules and install:
+
+```bash
+module load cuda/12.2          # adjust to your cluster's module name
+module load python/3.10        # or your preferred Python module
+
+cd /path/to/AccelLinearAttn/PhotonLib
+pip3 install --user .           # installs into ~/.local for your user
+```
+
+Then run the profiler:
+
+```bash
+cd /path/to/AccelLinearAttn
+python3 profile.py
+```
+
+> `profile.py` always runs on `cuda:0`. With `--gres=gpu:2` both GPUs are
+> reserved; the second is available for experiments you add manually.
+
+---
+
+### Batch job script
+
+Save as `submit.sh` at the repo root and submit with `sbatch submit.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --account=<-->
+#SBATCH --partition=gpu_standard
+#SBATCH --nodes=1
+#SBATCH --ntasks=2
+#SBATCH --gres=gpu:2
+#SBATCH --time=2:00:00
+#SBATCH --job-name=photon-profile
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
+
+module load cuda/12.2
+module load python/3.10
+
+# Install if not already present
+pip3 install --user --quiet /path/to/AccelLinearAttn/PhotonLib
+
+cd /path/to/AccelLinearAttn
+python3 profile.py
+```
+
+```bash
+mkdir -p logs
+sbatch submit.sh
+```
+
+Monitor with:
+
+```bash
+squeue --me
+tail -f logs/<job-id>.out
+```
+
+---
+
 ## Container setup
 
 A Dev Container configuration is provided for environments without a local CUDA install:
