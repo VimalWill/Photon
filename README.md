@@ -124,6 +124,45 @@ Flash path covers d <= 128 (sm80)
 
 ## HPC / SLURM deployment
 
+### University of Arizona HPC (Puma)
+
+UA HPC uses the OHPC module system. The default GCC (`gnu8/8.3.0`) is too old for PyTorch — use the system GCC 13 which is on `$PATH` by default.
+
+**Puma GPU:** Tesla V100S-PCIE-32GB → `sm_70`
+
+**Interactive build session:**
+
+```bash
+# Request a GPU node
+interactive -a <your-group> -p gpu_standard -t 02:00:00 --gres=gpu:1
+
+# Load CUDA (check available versions with: module avail cuda12)
+module load cuda12/12.4.1
+
+# Verify GCC is >= 9 (system GCC 13 should be on PATH by default)
+gcc --version
+
+# Set architecture list — include sm_70 for V100, extend as needed
+export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0"
+
+# Build and install in editable mode
+cd /path/to/Photon/PhotonLib
+pip3 install --no-build-isolation -e .
+```
+
+> **Why `--no-build-isolation`?** The HPC PyTorch install lives in `~/.local` rather than a standard virtualenv. Without this flag, pip creates an isolated build environment that can't find the existing PyTorch headers and fails.
+
+> **Why set `TORCH_CUDA_ARCH_LIST`?** The default arch list in `setup.py` targets sm_75+ (Turing and newer). V100 GPUs (Puma) are sm_70 and will raise `no kernel image is available for execution on the device` at runtime if sm_70 is omitted.
+
+**Verify the compiled architectures after build:**
+
+```bash
+cuobjdump /path/to/PhotonLib/photon.cpython-*.so | grep arch
+# should list: sm_70  sm_75  sm_80  sm_86  sm_90
+```
+
+---
+
 ### Interactive session (2 GPUs)
 
 ```bash
@@ -135,11 +174,11 @@ salloc --account=<--> --partition=gpu_standard \
 Once the shell is granted, load the required modules and install:
 
 ```bash
-module load cuda/12.2          # adjust to your cluster's module name
-module load python/3.10        # or your preferred Python module
+module load cuda12/12.4.1      # adjust to your cluster's module name
 
 cd /path/to/AccelLinearAttn/PhotonLib
-pip3 install --user .           # installs into ~/.local for your user
+export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0"
+pip3 install --no-build-isolation -e .
 ```
 
 Then run the profiler:
@@ -170,11 +209,11 @@ Save as `submit.sh` at the repo root and submit with `sbatch submit.sh`:
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-module load cuda/12.2
-module load python/3.10
+module load cuda12/12.4.1      # adjust to your cluster's module name
 
-# Install if not already present
-pip3 install --user --quiet /path/to/AccelLinearAttn/PhotonLib
+# Install if not already present (set arch list to match your GPU)
+export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0"
+pip3 install --no-build-isolation --quiet /path/to/AccelLinearAttn/PhotonLib
 
 cd /path/to/AccelLinearAttn
 python3 profile.py
